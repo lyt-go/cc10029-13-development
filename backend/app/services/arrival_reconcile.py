@@ -63,17 +63,32 @@ class ArrivalReconcileService(BaseModuleService):
         batch_records = self._read_jsonl(batch_file)
         source_count = len(batch_records)
 
-        # 从暂存产品目录查找目标落地产物文件
+        # 到达对账优先读取对账血缘确认图钉住的数据来源（不能混读图外分区）；
+        # 批次尚未建图时回退到暂存目录扫描。
         staging_dir = self._data_dir("staging")
+        pinned_files: list[str] = []
+        try:
+            graph_svc = self._safe_import(
+                "app.services.reconcile_lineage_graph", "ReconcileLineageGraphService")()
+            pinned_files = graph_svc.get_pinned_source(batch_code)
+        except Exception:
+            pinned_files = []
         staging_count = 0
         late_count = 0
-        for sf in staging_dir.glob(f"*{batch_code}*.jsonl"):
-            s_records = self._read_jsonl(sf)
-            staging_count = len(s_records)
+        if pinned_files:
+            for name in pinned_files:
+                staging_count += len(self._read_jsonl(staging_dir / name))
             # 计算迟到条数：目标端实际记录数少于源端基准
             if staging_count < expected:
                 late_count = expected - staging_count
-            break
+        else:
+            for sf in staging_dir.glob(f"*{batch_code}*.jsonl"):
+                s_records = self._read_jsonl(sf)
+                staging_count = len(s_records)
+                # 计算迟到条数：目标端实际记录数少于源端基准
+                if staging_count < expected:
+                    late_count = expected - staging_count
+                break
 
         missing_count = max(0, expected - staging_count)
         is_balanced = expected == staging_count
@@ -119,5 +134,16 @@ class ArrivalReconcileService(BaseModuleService):
             result["auto_lineage"] = lineage_result
         except Exception as e:
             result["auto_lineage"] = {"error": str(e)}
+
+        # 批次还没有有效确认图时，为这一轮对账补上确认图节点，
+        # 让值班人员能从图上的对账版本发起复核
+        try:
+            graph_svc = self._safe_import(
+                "app.services.reconcile_lineage_graph", "ReconcileLineageGraphService")()
+            if not graph_svc.get_pinned_source(batch_code):
+                graph_result = graph_svc.build_graph(batch_code, recon_code=recon_entry["对账编号"])
+                result["auto_graph"] = graph_result
+        except Exception as e:
+            result["auto_graph"] = {"error": str(e)}
 
         return result

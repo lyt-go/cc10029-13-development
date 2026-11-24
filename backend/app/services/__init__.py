@@ -16,6 +16,7 @@ from app.services.speed_control import SpeedControlService
 from app.services.reject_record import RejectRecordService
 from app.services.format_adapt import FormatAdaptService
 from app.services.transfer_lineage import TransferLineageService
+from app.services.reconcile_lineage_graph import ReconcileLineageGraphService
 from app.services.history_archive import HistoryArchiveService
 from app.services.exchange_replay import ExchangeReplayService
 from app.services.sla_monitor import SlaMonitorService
@@ -36,6 +37,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "reject_record": RejectRecordService(),
     "format_adapt": FormatAdaptService(),
     "transfer_lineage": TransferLineageService(),
+    "reconcile_lineage_graph": ReconcileLineageGraphService(),
     "history_archive": HistoryArchiveService(),
     "exchange_replay": ExchangeReplayService(),
     "sla_monitor": SlaMonitorService(),

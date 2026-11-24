@@ -11,7 +11,7 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
-│   ├── src/data/modules.ts              18个业务模块配置
+│   ├── src/data/modules.ts              19个业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
@@ -64,6 +64,7 @@ npm run dev
 | 拒收回执 | `reject_record` | 拒收记录 | 拒收编号、批次编号、记录主键 |
 | 格式适配 | `format_adapt` | 适配版本 | 适配编号、记录格式、旧版结构 |
 | 传输血缘 | `transfer_lineage` | 血缘链路 | 链路编号、源端编号、抽取窗口 |
+| 对账血缘确认图 | `reconcile_lineage_graph` | 确认图 | 图编号、批次编号、对账轮次 |
 | 批次归档 | `history_archive` | 归档卷 | 归档编号、批次范围、归档路径 |
 | 历史重放 | `exchange_replay` | 重放任务 | 重放编号、归档编号、重放范围 |
 | 时效监控 | `sla_monitor` | 时效指标 | 指标编号、源端编号、约定到达时限 |

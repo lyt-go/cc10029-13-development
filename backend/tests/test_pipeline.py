@@ -8,6 +8,7 @@ import os
 import json
 import time
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from app.services.resume_point import ResumePointService
 from app.services.speed_control import SpeedControlService
 from app.services.format_adapt import FormatAdaptService
 from app.services.transfer_lineage import TransferLineageService
+from app.services.reconcile_lineage_graph import ReconcileLineageGraphService
 from app.services.history_archive import HistoryArchiveService
 from app.services.exchange_replay import ExchangeReplayService
 from app.services.sla_monitor import SlaMonitorService
@@ -275,6 +277,125 @@ class TestChain8ArchiveAndReplay:
         assert result["status"] == "已销毁"
 
 
+class TestChain9ReconcileLineageGraph:
+    """链路9: 对账血缘确认图（两轮对账版本隔离、复核交付与补单追补）"""
+
+    @staticmethod
+    def _unique_batch(tag: str) -> str:
+        """生成每次运行唯一的批次编号：暂存产物按批次名归档且只追加，
+        唯一编号保证重复跑测试时分区文件互不混淆。"""
+        return f"TRAN-GRAPH-{tag}-{time.time_ns()}"
+
+    def _land_partition(self, svc, batch_code: str, tag: str, count: int) -> str:
+        """为批次直接落地一份暂存分区文件，返回文件名。"""
+        filename = f"STAG-{batch_code}-{tag}.jsonl"
+        svc._write_jsonl(svc._data_dir("staging") / filename,
+                         svc._simulate_records(batch_code, count=count))
+        return filename
+
+    def _run_first_round(self, batch_code: str, expected: int = 20, arrived: int = 10):
+        """跑通第一轮对账：部分分区到达 → 存在差异，自动建图钉住第一轮区段。"""
+        g_svc = ReconcileLineageGraphService()
+        ar_svc = ArrivalReconcileService()
+        first_file = self._land_partition(g_svc, batch_code, "PART1", arrived)
+        recon = ar_svc.create_reconciliation(batch_code, expected)
+        result = ar_svc.execute_reconciliation(recon["recon_id"])
+        assert result["actual"] == arrived
+        assert result["balanced"] is False
+        assert "auto_graph" in result and "error" not in str(result["auto_graph"])
+        graph = result["auto_graph"]
+        assert [p["file"] for p in graph["partitions"]] == [first_file]
+        return g_svc, ar_svc, graph, first_file
+
+    def test_concurrent_review_reads_only_first_round(self):
+        """同一批次两轮对账结果不同：补到文件只属于第二轮，
+        从第一轮历史节点发出的并发复核只读第一轮钉住的区段。"""
+        batch = self._unique_batch("ISO")
+        g_svc, _, graph, first_file = self._run_first_round(batch)
+        # 补到文件：一份完整分区，只属于第二轮
+        self._land_partition(g_svc, batch, "FULL2", 20)
+
+        # 操作员从第一轮的链路查询里发出并发复核请求
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reviews = list(pool.map(lambda _: g_svc.start_review(graph["graph_id"]), range(2)))
+        for review in reviews:
+            assert "error" not in review
+            assert review["partitions_read"] == [first_file]
+            assert review["records_read"] == 10
+            assert review["reconcile_version"] == "v1.0"
+
+        # 图上选定的批次+对账版本+暂存分区对应一次可回查的交付
+        delivery = g_svc.get_review_delivery(reviews[0]["review_code"])
+        assert delivery["recheckable"] is True
+        assert delivery["delivery"]["checksum"] == reviews[0]["checksum"]
+        assert delivery["delivery"]["records_read"] == 10
+
+    def test_next_round_reads_own_partitions_no_mixed_read(self):
+        """用图新建下一轮对账：本次实际处理的分区可查，到达对账读图钉住的来源。"""
+        batch = self._unique_batch("NEXT")
+        g_svc, ar_svc, graph, _ = self._run_first_round(batch)
+        full_file = self._land_partition(g_svc, batch, "FULL2", 20)
+
+        # 未建新一轮前直接再对账：仍读第一轮图钉住的来源，不混读补到文件
+        recon_direct = ar_svc.create_reconciliation(batch, 20)
+        direct = ar_svc.execute_reconciliation(recon_direct["recon_id"])
+        assert direct["actual"] == 10
+        assert direct["balanced"] is False
+
+        # 用图新建下一轮：钉住本次实际处理的完整分区
+        nxt = g_svc.create_next_round(graph["graph_id"], expected_count=20)
+        assert nxt["round_no"] == 2
+        assert [p["file"] for p in nxt["partitions"]] == [full_file]
+
+        # 第二轮对账读新图钉住的来源，得到与第一轮不同的结果
+        result2 = ar_svc.execute_reconciliation(nxt["new_recon"]["recon_id"])
+        assert result2["actual"] == 20
+        assert result2["balanced"] is True
+
+        # 图上能查出两轮各自的版本与实际落地区段
+        view = g_svc.query_graph(batch)
+        assert view["count"] == 2
+        assert view["rounds"][0]["reconcile_version"] == "v1.0"
+        assert view["rounds"][1]["reconcile_version"] == "v2.0"
+        assert [p["file"] for p in view["rounds"][1]["partitions"]] == [full_file]
+
+    def test_supplement_order_activation_and_backlog(self):
+        """从第一轮历史节点复核旧账→同图发起补单→第二轮完整分区生效→核对追补。"""
+        batch = self._unique_batch("SUPP")
+        g_svc, ar_svc, graph, first_file = self._run_first_round(batch)
+        full_file = self._land_partition(g_svc, batch, "FULL2", 20)
+        nxt = g_svc.create_next_round(graph["graph_id"], expected_count=20)
+
+        # 从第一轮的历史节点复核旧账
+        review = g_svc.start_review(graph["graph_id"])
+        assert review["records_read"] == 10
+
+        # 从同一张图发起补单：遇到另一份完整分区，保存本次使用的数据和关联血缘
+        supp = g_svc.create_supplement_order(graph["graph_id"])
+        assert supp["extra_complete_partitions"] == [full_file]
+        assert supp["source_partitions"] == [full_file]
+        assert supp["records_used"] == 20
+        assert supp["lineage_refs"]
+        assert Path(supp["data_path"]).exists()
+
+        # 让第二轮完整分区生效
+        activated = g_svc.activate_partition(nxt["new_graph"]["graph_id"])
+        assert activated["status"] == "已确认"
+        assert g_svc.get_pinned_source(batch) == [full_file]
+
+        # 旧图仍可复核原结果
+        again = g_svc.start_review(graph["graph_id"])
+        assert again["records_read"] == 10
+        assert again["partitions_read"] == [first_file]
+
+        # 核对补单实际读取的数据 + 下一次要追补的清单
+        verify = g_svc.verify_supplement_reading(graph["graph_id"])
+        assert verify["reading"]["checksum_match"] is True
+        assert verify["reading"]["records_read"] == 20
+        assert verify["uncovered_partitions"] == []
+        assert batch not in verify["backlog_batches"]
+
+
 class TestCrossModuleSnapshot:
     """跨模块汇总验证：所有模块 domain_snapshot 可调用。"""
     MODULES = [
@@ -292,6 +413,7 @@ class TestCrossModuleSnapshot:
         ("reject_record", RejectRecordService),
         ("format_adapt", FormatAdaptService),
         ("transfer_lineage", TransferLineageService),
+        ("reconcile_lineage_graph", ReconcileLineageGraphService),
         ("history_archive", HistoryArchiveService),
         ("exchange_replay", ExchangeReplayService),
         ("sla_monitor", SlaMonitorService),
